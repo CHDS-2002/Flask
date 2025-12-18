@@ -1,0 +1,48 @@
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, flash
+from flask_wtf import FlaskForm
+from wtforms import StringField, SubmitField
+from wtforms.validators import DataRequired
+import os
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
+
+# Определение формы
+class ContactForm(FlaskForm):
+    name = StringField('Ваше имя', validators=[DataRequired()])
+    email = StringField('Email', validators=[DataRequired()])
+    message = StringField('Сообщение', validators=[DataRequired()])
+    submit = SubmitField('Отправить')
+
+# Главная страница
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# Страница с формой
+@app.route('/contact', methods=['GET', 'POST'])
+def contact():
+    form = ContactForm()
+    
+    if form.validate_on_submit():
+        # Обработка данных формы
+        name = form.name.data
+        email = form.email.data
+        message = form.message.data
+        
+        # Здесь можно добавить логику обработки данных
+        # Например, сохранение в БД или отправку email
+        
+        flash(f'Спасибо, {name}! Ваше сообщение отправлено.', 'success')
+        return redirect(url_for('contact'))
+    
+    return render_template('contact.html', form=form)
+
+# Страница "О нас"
+@app.route('/about')
+def about():
+    return render_template('about.html')
+
+if __name__ == '__main__':
+    app.run(debug=True)

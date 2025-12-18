@@ -1,0 +1,422 @@
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_wtf import FlaskForm
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from wtforms import StringField, SubmitField, TextAreaField, PasswordField, BooleanField
+from wtforms.validators import DataRequired, Email, Length, EqualTo, ValidationError
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
+import os
+
+# Инициализация Flask
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
+
+# Конфигурация базы данных
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'app.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Инициализация расширений
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Пожалуйста, войдите в систему для доступа к этой странице.'
+login_manager.login_message_category = 'warning'
+
+# Модель пользователя
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    
+    # Связи
+    messages = db.relationship('ContactMessage', backref='author', lazy=True)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+# Модель для хранения сообщений из формы
+class ContactMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+    
+    def __repr__(self):
+        return f'<ContactMessage {self.name}>'
+
+# Форма регистрации
+class RegistrationForm(FlaskForm):
+    username = StringField('Имя пользователя', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=3, max=80, message="Имя пользователя должно быть от 3 до 80 символов")
+    ])
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес"),
+        Length(max=120)
+    ])
+    password = PasswordField('Пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=6, message="Пароль должен содержать минимум 6 символов")
+    ])
+    confirm_password = PasswordField('Подтвердите пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        EqualTo('password', message="Пароли должны совпадать")
+    ])
+    submit = SubmitField('Зарегистрироваться')
+    
+    def validate_username(self, username):
+        user = User.query.filter_by(username=username.data).first()
+        if user:
+            raise ValidationError('Это имя пользователя уже занято. Выберите другое.')
+    
+    def validate_email(self, email):
+        user = User.query.filter_by(email=email.data).first()
+        if user:
+            raise ValidationError('Этот email уже зарегистрирован.')
+
+# Форма авторизации
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес")
+    ])
+    password = PasswordField('Пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения")
+    ])
+    remember = BooleanField('Запомнить меня')
+    submit = SubmitField('Войти')
+
+# Форма изменения пароля
+class ChangePasswordForm(FlaskForm):
+    current_password = PasswordField('Текущий пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения")
+    ])
+    new_password = PasswordField('Новый пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=6, message="Пароль должен содержать минимум 6 символов")
+    ])
+    confirm_password = PasswordField('Подтвердите новый пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        EqualTo('new_password', message="Пароли должны совпадать")
+    ])
+    submit = SubmitField('Изменить пароль')
+
+# Форма обратной связи
+class ContactForm(FlaskForm):
+    name = StringField('Ваше имя', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=2, max=100)
+    ])
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес")
+    ])
+    message = TextAreaField('Сообщение', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=10, max=500)
+    ])
+    submit = SubmitField('Отправить')
+
+# Загрузчик пользователя для Flask-Login
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Создание таблиц базы данных
+with app.app_context():
+    db.create_all()
+
+# Главная страница
+@app.route('/')
+def index():
+    total_messages = ContactMessage.query.count()
+    total_users = User.query.count()
+    return render_template('index.html', total_messages=total_messages, total_users=total_users)
+
+# Страница регистрации
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    
+    form = RegistrationForm()
+    
+    if form.validate_on_submit():
+        user = User(
+            username=form.username.data,
+            email=form.email.data
+        )
+        user.set_password(form.password.data)
+        
+        try:
+            db.session.add(user)
+            db.session.commit()
+            flash('Регистрация прошла успешно! Теперь вы можете войти в систему.', 'success')
+            return redirect(url_for('login'))
+        except Exception as e:
+            db.session.rollback()
+            flash('Произошла ошибка при регистрации. Попробуйте еще раз.', 'danger')
+            app.logger.error(f'Registration error: {str(e)}')
+    
+    return render_template('register.html', form=form)
+
+# Страница авторизации
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    
+    form = LoginForm()
+    
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        
+        if user and user.check_password(form.password.data):
+            if not user.is_active:
+                flash('Ваш аккаунт деактивирован. Обратитесь к администратору.', 'danger')
+                return redirect(url_for('login'))
+            
+            login_user(user, remember=form.remember.data)
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+            
+            flash(f'Добро пожаловать, {user.username}!', 'success')
+            
+            next_page = request.args.get('next')
+            return redirect(next_page) if next_page else redirect(url_for('index'))
+        else:
+            flash('Неверный email или пароль.', 'danger')
+    
+    return render_template('login.html', form=form)
+
+# Выход из системы
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Вы успешно вышли из системы.', 'info')
+    return redirect(url_for('index'))
+
+# Профиль пользователя
+@app.route('/profile')
+@login_required
+def profile():
+    user_messages = ContactMessage.query.filter_by(user_id=current_user.id).count()
+    return render_template('profile.html', user=current_user, user_messages=user_messages)
+
+# Изменение пароля
+@app.route('/change_password', methods=['GET', 'POST'])
+@login_required
+def change_password():
+    form = ChangePasswordForm()
+    
+    if form.validate_on_submit():
+        if current_user.check_password(form.current_password.data):
+            current_user.set_password(form.new_password.data)
+            db.session.commit()
+            flash('Пароль успешно изменен.', 'success')
+            return redirect(url_for('profile'))
+        else:
+            flash('Текущий пароль введен неверно.', 'danger')
+    
+    return render_template('change_password.html', form=form)
+
+# Админ-панель (только для администраторов)
+@app.route('/admin')
+@login_required
+def admin_panel():
+    if not current_user.is_admin:
+        flash('У вас нет прав для доступа к этой странице.', 'danger')
+        return redirect(url_for('index'))
+    
+    users = User.query.all()
+    messages = ContactMessage.query.order_by(ContactMessage.created_at.desc()).limit(10).all()
+    
+    return render_template('admin.html', users=users, messages=messages)
+
+# Страница с формой обратной связи
+@app.route('/contact', methods=['GET', 'POST'])
+def contact():
+    form = ContactForm()
+    
+    # Если пользователь авторизован, заполняем поля автоматически
+    if current_user.is_authenticated:
+        form.name.data = current_user.username
+        form.email.data = current_user.email
+    
+    if form.validate_on_submit():
+        # Создание нового сообщения
+        new_message = ContactMessage(
+            user_id=current_user.id if current_user.is_authenticated else None,
+            name=form.name.data,
+            email=form.email.data,
+            message=form.message.data
+        )
+        
+        try:
+            db.session.add(new_message)
+            db.session.commit()
+            flash(f'Спасибо, {form.name.data}! Ваше сообщение сохранено.', 'success')
+            return redirect(url_for('contact'))
+        except Exception as e:
+            db.session.rollback()
+            flash('Произошла ошибка при сохранении сообщения. Попробуйте еще раз.', 'danger')
+            app.logger.error(f'Error saving message: {str(e)}')
+    
+    return render_template('contact.html', form=form)
+
+# Страница для просмотра всех сообщений
+@app.route('/messages')
+@login_required
+def view_messages():
+    page = request.args.get('page', 1, type=int)
+    per_page = 10
+    
+    # Если пользователь не админ, показываем только его сообщения
+    if current_user.is_admin:
+        messages = ContactMessage.query.order_by(ContactMessage.created_at.desc()).paginate(
+            page=page, per_page=per_page, error_out=False
+        )
+    else:
+        messages = ContactMessage.query.filter_by(user_id=current_user.id).order_by(
+            ContactMessage.created_at.desc()
+        ).paginate(page=page, per_page=per_page, error_out=False)
+    
+    return render_template('messages.html', messages=messages)
+
+# JSON API для проверки доступности email (AJAX)
+@app.route('/api/check_email')
+def check_email():
+    email = request.args.get('email', '').strip()
+    
+    if not email:
+        return jsonify({'available': False})
+    
+    user = User.query.filter_by(email=email).first()
+    return jsonify({'available': user is None})
+
+# JSON API для проверки доступности username
+@app.route('/api/check_username')
+def check_username():
+    username = request.args.get('username', '').strip()
+    
+    if not username:
+        return jsonify({'available': False})
+    
+    user = User.query.filter_by(username=username).first()
+    return jsonify({'available': user is None})
+
+# Команда для создания администратора
+@app.cli.command('create-admin')
+def create_admin():
+    """Создание администратора."""
+    from getpass import getpass
+    
+    username = input('Имя пользователя: ')
+    email = input('Email: ')
+    password = getpass('Пароль: ')
+    confirm_password = getpass('Подтвердите пароль: ')
+    
+    if password != confirm_password:
+        print('Пароли не совпадают!')
+        return
+    
+    user = User.query.filter_by(email=email).first()
+    if user:
+        print('Пользователь с таким email уже существует!')
+        return
+    
+    user = User.query.filter_by(username=username).first()
+    if user:
+        print('Пользователь с таким именем уже существует!')
+        return
+    
+    admin = User(
+        username=username,
+        email=email,
+        is_admin=True
+    )
+    admin.set_password(password)
+    
+    db.session.add(admin)
+    db.session.commit()
+    print(f'Администратор {username} успешно создан!')
+
+# Команда для инициализации базы данных
+@app.cli.command('init-db')
+def init_db_command():
+    """Инициализирует базу данных."""
+    db.create_all()
+    print('База данных инициализирована.')
+
+# Команда для заполнения тестовыми данными
+@app.cli.command('seed-db')
+def seed_db_command():
+    """Заполняет базу данных тестовыми данными."""
+    from datetime import datetime, timedelta
+    
+    # Создаем тестового пользователя
+    if not User.query.filter_by(email='user@example.com').first():
+        user = User(
+            username='testuser',
+            email='user@example.com',
+            is_admin=False
+        )
+        user.set_password('password123')
+        db.session.add(user)
+    
+    # Создаем тестового администратора
+    if not User.query.filter_by(email='admin@example.com').first():
+        admin = User(
+            username='admin',
+            email='admin@example.com',
+            is_admin=True
+        )
+        admin.set_password('admin123')
+        db.session.add(admin)
+    
+    # Создаем несколько тестовых сообщений
+    test_messages = [
+        ContactMessage(
+            name='Иван Иванов',
+            email='ivan@example.com',
+            message='Это тестовое сообщение для проверки работы приложения.',
+            created_at=datetime.utcnow() - timedelta(days=3),
+            is_read=True
+        ),
+        ContactMessage(
+            name='Мария Петрова',
+            email='maria@example.com',
+            message='Вопрос по поводу работы формы обратной связи.',
+            created_at=datetime.utcnow() - timedelta(days=1),
+            is_read=False
+        ),
+    ]
+    
+    for msg in test_messages:
+        if not ContactMessage.query.filter_by(email=msg.email, created_at=msg.created_at).first():
+            db.session.add(msg)
+    
+    db.session.commit()
+    print('Тестовые данные добавлены в базу данных.')
+
+if __name__ == '__main__':
+    app.run(debug=True)

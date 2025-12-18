@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Мое Flask-приложение{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav>
+        <a href="{{ url_for('index') }}">Главная</a>
+        <a href="{{ url_for('contact') }}">Контакты</a>
+        <a href="{{ url_for('about') }}">О нас</a>
+    </nav>
+    
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>
+
+{% extends "base.html" %}
+
+{% block title %}Главная страница{% endblock %}
+
+{% block content %}
+<h1>Добро пожаловать в мое Flask-приложение!</h1>
+<p>Это базовая структура Flask-приложения с формой.</p>
+<a href="{{ url_for('contact') }}" class="btn">Перейти к форме</a>
+{% endblock %}
+
+{% extends "base.html" %}
+
+{% block title %}Форма обратной связи{% endblock %}
+
+{% block content %}
+<h1>Форма обратной связи</h1>
+
+<form method="POST" action="{{ url_for('contact') }}">
+    {{ form.csrf_token }}
+    
+    <div class="form-group">
+        {{ form.name.label }}
+        {{ form.name(size=20) }}
+        {% if form.name.errors %}
+            <ul class="errors">
+                {% for error in form.name.errors %}
+                    <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    </div>
+    
+    <div class="form-group">
+        {{ form.email.label }}
+        {{ form.email(size=30) }}
+        {% if form.email.errors %}
+            <ul class="errors">
+                {% for error in form.email.errors %}
+                    <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    </div>
+    
+    <div class="form-group">
+        {{ form.message.label }}
+        {{ form.message(rows=5, cols=40) }}
+        {% if form.message.errors %}
+            <ul class="errors">
+                {% for error in form.message.errors %}
+                    <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    </div>
+    
+    <div class="form-group">
+        {{ form.submit() }}
+    </div>
+</form>
+{% endblock %}
+
+{% extends "base.html" %}
+
+{% block title %}О нас{% endblock %}
+
+{% block content %}
+<h1>О нашем приложении</h1>
+<p>Это учебное Flask-приложение для демонстрации работы с формами.</p>
+{% endblock %}

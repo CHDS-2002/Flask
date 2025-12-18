@@ -1,0 +1,1367 @@
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, make_response
+from flask_wtf import FlaskForm
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_restful import Api, Resource, reqparse, fields, marshal_with, marshal
+from flask_jwt_extended import (
+    JWTManager, create_access_token, create_refresh_token, 
+    jwt_required, get_jwt_identity, get_jwt,
+    current_user as jwt_current_user
+)
+from flask_cors import CORS
+from wtforms import StringField, SubmitField, TextAreaField, PasswordField, BooleanField
+from wtforms.validators import DataRequired, Email, Length, EqualTo, ValidationError
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta, timezone
+import os
+import uuid
+from functools import wraps
+
+# Инициализация Flask
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'jwt-secret-key-456')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days=30)
+
+# Конфигурация базы данных
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL', 'sqlite:///' + os.path.join(basedir, 'app.db')
+)
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Инициализация расширений
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+api = Api(app, prefix='/api/v1')
+jwt = JWTManager(app)
+CORS(app)  # Включаем CORS для API
+
+# Настройка Flask-Login
+login_manager.login_view = 'login'
+login_manager.login_message = 'Пожалуйста, войдите в систему для доступа к этой странице.'
+login_manager.login_message_category = 'warning'
+
+# ============= МОДЕЛИ БАЗЫ ДАННЫХ =============
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    public_id = db.Column(db.String(50), unique=True, default=lambda: str(uuid.uuid4()))
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    is_admin = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    api_key = db.Column(db.String(100), unique=True, nullable=True)
+    
+    # Связи
+    messages = db.relationship('ContactMessage', backref='author', lazy=True)
+    posts = db.relationship('Post', backref='author', lazy=True)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
+    def generate_api_key(self):
+        self.api_key = str(uuid.uuid4())
+        return self.api_key
+
+class ContactMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    public_id = db.Column(db.String(50), unique=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+    
+    def __repr__(self):
+        return f'<ContactMessage {self.name}>'
+    
+    def to_dict(self):
+        return {
+            'id': self.public_id,
+            'name': self.name,
+            'email': self.email,
+            'message': self.message,
+            'created_at': self.created_at.isoformat(),
+            'is_read': self.is_read,
+            'user_id': User.query.get(self.user_id).public_id if self.user_id else None
+        }
+
+class Post(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    public_id = db.Column(db.String(50), unique=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_published = db.Column(db.Boolean, default=True)
+    tags = db.Column(db.String(500), default='')
+    
+    def __repr__(self):
+        return f'<Post {self.title}>'
+    
+    def to_dict(self):
+        return {
+            'id': self.public_id,
+            'title': self.title,
+            'content': self.content,
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat(),
+            'is_published': self.is_published,
+            'tags': self.tags.split(',') if self.tags else [],
+            'author': User.query.get(self.user_id).username if self.user_id else None,
+            'author_id': User.query.get(self.user_id).public_id if self.user_id else None
+        }
+
+class ApiLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    endpoint = db.Column(db.String(200), nullable=False)
+    method = db.Column(db.String(10), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    ip_address = db.Column(db.String(50), nullable=True)
+    user_agent = db.Column(db.Text, nullable=True)
+    status_code = db.Column(db.Integer, nullable=False)
+    response_time = db.Column(db.Float, nullable=False)  # в секундах
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<ApiLog {self.method} {self.endpoint} {self.status_code}>'
+
+# ============= JWT КОНФИГУРАЦИЯ =============
+
+@jwt.user_lookup_loader
+def user_lookup_callback(_jwt_header, jwt_data):
+    identity = jwt_data["sub"]
+    return User.query.filter_by(public_id=identity).first()
+
+@jwt.user_identity_loader
+def user_identity_lookup(user):
+    return user.public_id
+
+# ============= ФОРМЫ =============
+
+class RegistrationForm(FlaskForm):
+    username = StringField('Имя пользователя', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=3, max=80)
+    ])
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес"),
+        Length(max=120)
+    ])
+    password = PasswordField('Пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=6, message="Пароль должен содержать минимум 6 символов")
+    ])
+    confirm_password = PasswordField('Подтвердите пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        EqualTo('password', message="Пароли должны совпадать")
+    ])
+    submit = SubmitField('Зарегистрироваться')
+
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес")
+    ])
+    password = PasswordField('Пароль', validators=[
+        DataRequired(message="Поле обязательно для заполнения")
+    ])
+    remember = BooleanField('Запомнить меня')
+    submit = SubmitField('Войти')
+
+class ContactForm(FlaskForm):
+    name = StringField('Ваше имя', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=2, max=100)
+    ])
+    email = StringField('Email', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Email(message="Введите корректный email адрес")
+    ])
+    message = TextAreaField('Сообщение', validators=[
+        DataRequired(message="Поле обязательно для заполнения"),
+        Length(min=10, max=500)
+    ])
+    submit = SubmitField('Отправить')
+
+# ============= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =============
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+def log_api_request(endpoint, method, user_id, ip_address, user_agent, status_code, response_time):
+    log = ApiLog(
+        endpoint=endpoint,
+        method=method,
+        user_id=user_id,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        status_code=status_code,
+        response_time=response_time
+    )
+    db.session.add(log)
+    db.session.commit()
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin:
+            return jsonify({'message': 'Требуются права администратора'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ============= API РЕСУРСЫ =============
+
+# Парсеры запросов
+user_parser = reqparse.RequestParser()
+user_parser.add_argument('username', type=str, required=True, help='Имя пользователя обязательно')
+user_parser.add_argument('email', type=str, required=True, help='Email обязателен')
+user_parser.add_argument('password', type=str, required=True, help='Пароль обязателен')
+
+login_parser = reqparse.RequestParser()
+login_parser.add_argument('email', type=str, required=True, help='Email обязателен')
+login_parser.add_argument('password', type=str, required=True, help='Пароль обязателен')
+
+message_parser = reqparse.RequestParser()
+message_parser.add_argument('name', type=str, required=True, help='Имя обязательно')
+message_parser.add_argument('email', type=str, required=True, help='Email обязателен')
+message_parser.add_argument('message', type=str, required=True, help='Сообщение обязательно')
+
+post_parser = reqparse.RequestParser()
+post_parser.add_argument('title', type=str, required=True, help='Заголовок обязателен')
+post_parser.add_argument('content', type=str, required=True, help='Содержание обязательно')
+post_parser.add_argument('is_published', type=bool, default=True)
+post_parser.add_argument('tags', type=str, default='')
+
+# Поля для маршалинга
+user_fields = {
+    'public_id': fields.String,
+    'username': fields.String,
+    'email': fields.String,
+    'created_at': fields.DateTime(dt_format='iso8601'),
+    'is_admin': fields.Boolean,
+    'last_login': fields.DateTime(dt_format='iso8601', attribute=lambda x: x.last_login if x.last_login else None)
+}
+
+message_fields = {
+    'public_id': fields.String,
+    'name': fields.String,
+    'email': fields.String,
+    'message': fields.String,
+    'created_at': fields.DateTime(dt_format='iso8601'),
+    'is_read': fields.Boolean,
+    'author': fields.String(attribute=lambda x: x.author.username if x.author else None)
+}
+
+post_fields = {
+    'public_id': fields.String,
+    'title': fields.String,
+    'content': fields.String,
+    'created_at': fields.DateTime(dt_format='iso8601'),
+    'updated_at': fields.DateTime(dt_format='iso8601'),
+    'is_published': fields.Boolean,
+    'tags': fields.List(fields.String),
+    'author': fields.String(attribute=lambda x: x.author.username)
+}
+
+# Ресурсы API
+
+class UserListResource(Resource):
+    @jwt_required()
+    @admin_required
+    def get(self):
+        """Получить список всех пользователей (только для админов)"""
+        users = User.query.all()
+        return {'users': [marshal(user, user_fields) for user in users]}
+    
+    def post(self):
+        """Создать нового пользователя (регистрация)"""
+        args = user_parser.parse_args()
+        
+        # Проверка существующего пользователя
+        if User.query.filter_by(email=args['email']).first():
+            return {'message': 'Пользователь с таким email уже существует'}, 400
+        
+        if User.query.filter_by(username=args['username']).first():
+            return {'message': 'Пользователь с таким именем уже существует'}, 400
+        
+        # Создание пользователя
+        user = User(
+            username=args['username'],
+            email=args['email']
+        )
+        user.set_password(args['password'])
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        # Создание JWT токена
+        access_token = create_access_token(identity=user)
+        refresh_token = create_refresh_token(identity=user)
+        
+        return {
+            'message': 'Пользователь успешно создан',
+            'user': marshal(user, user_fields),
+            'access_token': access_token,
+            'refresh_token': refresh_token
+        }, 201
+
+class UserResource(Resource):
+    @jwt_required()
+    def get(self, user_id):
+        """Получить информацию о пользователе"""
+        user = User.query.filter_by(public_id=user_id).first()
+        if not user:
+            return {'message': 'Пользователь не найден'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        if current_user_id != user_id and not User.query.filter_by(public_id=current_user_id).first().is_admin:
+            return {'message': 'Недостаточно прав'}, 403
+        
+        return {'user': marshal(user, user_fields)}
+    
+    @jwt_required()
+    def put(self, user_id):
+        """Обновить информацию о пользователе"""
+        user = User.query.filter_by(public_id=user_id).first()
+        if not user:
+            return {'message': 'Пользователь не найден'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        if current_user_id != user_id and not User.query.filter_by(public_id=current_user_id).first().is_admin:
+            return {'message': 'Недостаточно прав'}, 403
+        
+        parser = reqparse.RequestParser()
+        parser.add_argument('username', type=str)
+        parser.add_argument('email', type=str)
+        parser.add_argument('password', type=str)
+        args = parser.parse_args()
+        
+        if args['username']:
+            if User.query.filter_by(username=args['username']).filter(User.public_id != user_id).first():
+                return {'message': 'Имя пользователя уже занято'}, 400
+            user.username = args['username']
+        
+        if args['email']:
+            if User.query.filter_by(email=args['email']).filter(User.public_id != user_id).first():
+                return {'message': 'Email уже используется'}, 400
+            user.email = args['email']
+        
+        if args['password']:
+            user.set_password(args['password'])
+        
+        db.session.commit()
+        
+        return {'message': 'Пользователь обновлен', 'user': marshal(user, user_fields)}
+    
+    @jwt_required()
+    def delete(self, user_id):
+        """Удалить пользователя"""
+        user = User.query.filter_by(public_id=user_id).first()
+        if not user:
+            return {'message': 'Пользователь не найден'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        current_user = User.query.filter_by(public_id=current_user_id).first()
+        if not current_user.is_admin:
+            return {'message': 'Требуются права администратора'}, 403
+        
+        db.session.delete(user)
+        db.session.commit()
+        
+        return {'message': 'Пользователь удален'}, 200
+
+class LoginResource(Resource):
+    def post(self):
+        """Аутентификация пользователя"""
+        args = login_parser.parse_args()
+        
+        user = User.query.filter_by(email=args['email']).first()
+        
+        if not user or not user.check_password(args['password']):
+            return {'message': 'Неверный email или пароль'}, 401
+        
+        if not user.is_active:
+            return {'message': 'Аккаунт деактивирован'}, 403
+        
+        # Обновляем время последнего входа
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
+        # Создаем JWT токены
+        access_token = create_access_token(identity=user)
+        refresh_token = create_refresh_token(identity=user)
+        
+        return {
+            'message': 'Аутентификация успешна',
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'user': marshal(user, user_fields)
+        }
+
+class RefreshTokenResource(Resource):
+    @jwt_required(refresh=True)
+    def post(self):
+        """Обновить access токен"""
+        current_user_id = get_jwt_identity()
+        access_token = create_access_token(identity=current_user_id)
+        return {'access_token': access_token}
+
+class MessageListResource(Resource):
+    def get(self):
+        """Получить список сообщений"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        
+        # Базовый запрос
+        query = ContactMessage.query
+        
+        # Фильтрация по статусу прочтения
+        is_read = request.args.get('is_read', type=str)
+        if is_read is not None:
+            if is_read.lower() == 'true':
+                query = query.filter_by(is_read=True)
+            elif is_read.lower() == 'false':
+                query = query.filter_by(is_read=False)
+        
+        # Сортировка
+        sort_by = request.args.get('sort_by', 'created_at')
+        if sort_by in ['created_at', 'name', 'email']:
+            if request.args.get('sort_order', 'desc') == 'asc':
+                query = query.order_by(getattr(ContactMessage, sort_by).asc())
+            else:
+                query = query.order_by(getattr(ContactMessage, sort_by).desc())
+        
+        # Пагинация
+        messages = query.paginate(page=page, per_page=per_page, error_out=False)
+        
+        return {
+            'messages': [message.to_dict() for message in messages.items],
+            'total': messages.total,
+            'pages': messages.pages,
+            'current_page': messages.page,
+            'per_page': messages.per_page
+        }
+    
+    def post(self):
+        """Создать новое сообщение"""
+        args = message_parser.parse_args()
+        
+        # Проверяем, авторизован ли пользователь через JWT
+        user_id = None
+        try:
+            jwt_identity = get_jwt_identity()
+            if jwt_identity:
+                user = User.query.filter_by(public_id=jwt_identity).first()
+                if user:
+                    user_id = user.id
+        except:
+            pass
+        
+        message = ContactMessage(
+            user_id=user_id,
+            name=args['name'],
+            email=args['email'],
+            message=args['message']
+        )
+        
+        db.session.add(message)
+        db.session.commit()
+        
+        return {'message': 'Сообщение отправлено', 'data': message.to_dict()}, 201
+
+class MessageResource(Resource):
+    @jwt_required()
+    def get(self, message_id):
+        """Получить сообщение по ID"""
+        message = ContactMessage.query.filter_by(public_id=message_id).first()
+        if not message:
+            return {'message': 'Сообщение не найдено'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        current_user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not current_user.is_admin and (message.user_id is None or message.user_id != current_user.id):
+            return {'message': 'Недостаточно прав'}, 403
+        
+        return {'message': message.to_dict()}
+    
+    @jwt_required()
+    def put(self, message_id):
+        """Обновить сообщение"""
+        message = ContactMessage.query.filter_by(public_id=message_id).first()
+        if not message:
+            return {'message': 'Сообщение не найдено'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        current_user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not current_user.is_admin:
+            return {'message': 'Требуются права администратора'}, 403
+        
+        parser = reqparse.RequestParser()
+        parser.add_argument('is_read', type=bool)
+        args = parser.parse_args()
+        
+        if args['is_read'] is not None:
+            message.is_read = args['is_read']
+        
+        db.session.commit()
+        
+        return {'message': 'Сообщение обновлено', 'data': message.to_dict()}
+    
+    @jwt_required()
+    def delete(self, message_id):
+        """Удалить сообщение"""
+        message = ContactMessage.query.filter_by(public_id=message_id).first()
+        if not message:
+            return {'message': 'Сообщение не найдено'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        current_user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not current_user.is_admin and (message.user_id is None or message.user_id != current_user.id):
+            return {'message': 'Недостаточно прав'}, 403
+        
+        db.session.delete(message)
+        db.session.commit()
+        
+        return {'message': 'Сообщение удалено'}, 200
+
+class PostListResource(Resource):
+    def get(self):
+        """Получить список постов"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        published_only = request.args.get('published_only', 'true').lower() == 'true'
+        
+        # Базовый запрос
+        query = Post.query
+        
+        # Фильтрация по публикации
+        if published_only:
+            query = query.filter_by(is_published=True)
+        
+        # Фильтрация по тегам
+        tag = request.args.get('tag')
+        if tag:
+            query = query.filter(Post.tags.contains(tag))
+        
+        # Поиск
+        search = request.args.get('search')
+        if search:
+            query = query.filter(
+                db.or_(
+                    Post.title.contains(search),
+                    Post.content.contains(search)
+                )
+            )
+        
+        # Сортировка
+        sort_by = request.args.get('sort_by', 'created_at')
+        if sort_by in ['created_at', 'updated_at', 'title']:
+            if request.args.get('sort_order', 'desc') == 'asc':
+                query = query.order_by(getattr(Post, sort_by).asc())
+            else:
+                query = query.order_by(getattr(Post, sort_by).desc())
+        
+        # Пагинация
+        posts = query.paginate(page=page, per_page=per_page, error_out=False)
+        
+        return {
+            'posts': [post.to_dict() for post in posts.items],
+            'total': posts.total,
+            'pages': posts.pages,
+            'current_page': posts.page
+        }
+    
+    @jwt_required()
+    def post(self):
+        """Создать новый пост"""
+        args = post_parser.parse_args()
+        
+        current_user_id = get_jwt_identity()
+        user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not user:
+            return {'message': 'Пользователь не найден'}, 404
+        
+        post = Post(
+            user_id=user.id,
+            title=args['title'],
+            content=args['content'],
+            is_published=args['is_published'],
+            tags=','.join(args['tags']) if isinstance(args['tags'], list) else args['tags']
+        )
+        
+        db.session.add(post)
+        db.session.commit()
+        
+        return {'message': 'Пост создан', 'post': post.to_dict()}, 201
+
+class PostResource(Resource):
+    def get(self, post_id):
+        """Получить пост по ID"""
+        post = Post.query.filter_by(public_id=post_id).first()
+        if not post:
+            return {'message': 'Пост не найден'}, 404
+        
+        # Проверка на публикацию
+        if not post.is_published:
+            current_user_id = get_jwt_identity()
+            if current_user_id:
+                user = User.query.filter_by(public_id=current_user_id).first()
+                if not user or (user.id != post.user_id and not user.is_admin):
+                    return {'message': 'Пост не опубликован'}, 403
+            else:
+                return {'message': 'Пост не опубликован'}, 403
+        
+        return {'post': post.to_dict()}
+    
+    @jwt_required()
+    def put(self, post_id):
+        """Обновить пост"""
+        post = Post.query.filter_by(public_id=post_id).first()
+        if not post:
+            return {'message': 'Пост не найден'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not user or (user.id != post.user_id and not user.is_admin):
+            return {'message': 'Недостаточно прав'}, 403
+        
+        parser = reqparse.RequestParser()
+        parser.add_argument('title', type=str)
+        parser.add_argument('content', type=str)
+        parser.add_argument('is_published', type=bool)
+        parser.add_argument('tags', type=str)
+        args = parser.parse_args()
+        
+        if args['title']:
+            post.title = args['title']
+        if args['content']:
+            post.content = args['content']
+        if args['is_published'] is not None:
+            post.is_published = args['is_published']
+        if args['tags']:
+            post.tags = args['tags']
+        
+        post.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        return {'message': 'Пост обновлен', 'post': post.to_dict()}
+    
+    @jwt_required()
+    def delete(self, post_id):
+        """Удалить пост"""
+        post = Post.query.filter_by(public_id=post_id).first()
+        if not post:
+            return {'message': 'Пост не найден'}, 404
+        
+        # Проверка прав доступа
+        current_user_id = get_jwt_identity()
+        user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not user or (user.id != post.user_id and not user.is_admin):
+            return {'message': 'Недостаточно прав'}, 403
+        
+        db.session.delete(post)
+        db.session.commit()
+        
+        return {'message': 'Пост удален'}, 200
+
+class StatsResource(Resource):
+    @jwt_required()
+    def get(self):
+        """Получить статистику API"""
+        current_user_id = get_jwt_identity()
+        user = User.query.filter_by(public_id=current_user_id).first()
+        
+        if not user or not user.is_admin:
+            return {'message': 'Требуются права администратора'}, 403
+        
+        # Статистика пользователей
+        total_users = User.query.count()
+        active_users = User.query.filter_by(is_active=True).count()
+        admin_users = User.query.filter_by(is_admin=True).count()
+        
+        # Статистика сообщений
+        total_messages = ContactMessage.query.count()
+        unread_messages = ContactMessage.query.filter_by(is_read=False).count()
+        
+        # Статистика постов
+        total_posts = Post.query.count()
+        published_posts = Post.query.filter_by(is_published=True).count()
+        
+        # Статистика API
+        total_api_calls = ApiLog.query.count()
+        today = datetime.utcnow().date()
+        today_calls = ApiLog.query.filter(
+            db.func.date(ApiLog.created_at) == today
+        ).count()
+        
+        # Популярные эндпоинты
+        popular_endpoints = db.session.query(
+            ApiLog.endpoint,
+            db.func.count(ApiLog.id).label('count')
+        ).group_by(ApiLog.endpoint).order_by(db.desc('count')).limit(10).all()
+        
+        return {
+            'users': {
+                'total': total_users,
+                'active': active_users,
+                'admins': admin_users
+            },
+            'messages': {
+                'total': total_messages,
+                'unread': unread_messages
+            },
+            'posts': {
+                'total': total_posts,
+                'published': published_posts
+            },
+            'api': {
+                'total_calls': total_api_calls,
+                'today_calls': today_calls,
+                'popular_endpoints': [
+                    {'endpoint': ep[0], 'count': ep[1]} for ep in popular_endpoints
+                ]
+            }
+        }
+
+# Регистрация ресурсов API
+api.add_resource(UserListResource, '/users')
+api.add_resource(UserResource, '/users/<string:user_id>')
+api.add_resource(LoginResource, '/login')
+api.add_resource(RefreshTokenResource, '/refresh')
+api.add_resource(MessageListResource, '/messages')
+api.add_resource(MessageResource, '/messages/<string:message_id>')
+api.add_resource(PostListResource, '/posts')
+api.add_resource(PostResource, '/posts/<string:post_id>')
+api.add_resource(StatsResource, '/stats')
+
+# ============= ВЕБ-МАРШРУТЫ =============
+
+@app.route('/')
+def index():
+    total_messages = ContactMessage.query.count()
+    total_users = User.query.count()
+    total_posts = Post.query.filter_by(is_published=True).count()
+    return render_template('index.html', 
+                         total_messages=total_messages, 
+                         total_users=total_users,
+                         total_posts=total_posts)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    
+    form = RegistrationForm()
+    
+    if form.validate_on_submit():
+        user = User(
+            username=form.username.data,
+            email=form.email.data
+        )
+        user.set_password(form.password.data)
+        
+        try:
+            db.session.add(user)
+            db.session.commit()
+            flash('Регистрация прошла успешно! Теперь вы можете войти в систему.', 'success')
+            return redirect(url_for('login'))
+        except Exception as e:
+            db.session.rollback()
+            flash('Произошла ошибка при регистрации. Попробуйте еще раз.', 'danger')
+            app.logger.error(f'Registration error: {str(e)}')
+    
+    return render_template('register.html', form=form)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    
+    form = LoginForm()
+    
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        
+        if user and user.check_password(form.password.data):
+            if not user.is_active:
+                flash('Ваш аккаунт деактивирован. Обратитесь к администратору.', 'danger')
+                return redirect(url_for('login'))
+            
+            login_user(user, remember=form.remember.data)
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+            
+            flash(f'Добро пожаловать, {user.username}!', 'success')
+            
+            next_page = request.args.get('next')
+            return redirect(next_page) if next_page else redirect(url_for('index'))
+        else:
+            flash('Неверный email или пароль.', 'danger')
+    
+    return render_template('login.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Вы успешно вышли из системы.', 'info')
+    return redirect(url_for('index'))
+
+@app.route('/profile')
+@login_required
+def profile():
+    user_messages = ContactMessage.query.filter_by(user_id=current_user.id).count()
+    user_posts = Post.query.filter_by(user_id=current_user.id).count()
+    
+    # Генерация API ключа, если его нет
+    if not current_user.api_key:
+        current_user.generate_api_key()
+        db.session.commit()
+    
+    return render_template('profile.html', 
+                         user=current_user, 
+                         user_messages=user_messages,
+                         user_posts=user_posts)
+
+@app.route('/contact', methods=['GET', 'POST'])
+def contact():
+    form = ContactForm()
+    
+    if current_user.is_authenticated:
+        form.name.data = current_user.username
+        form.email.data = current_user.email
+    
+    if form.validate_on_submit():
+        new_message = ContactMessage(
+            user_id=current_user.id if current_user.is_authenticated else None,
+            name=form.name.data,
+            email=form.email.data,
+            message=form.message.data
+        )
+        
+        try:
+            db.session.add(new_message)
+            db.session.commit()
+            flash(f'Спасибо, {form.name.data}! Ваше сообщение сохранено.', 'success')
+            return redirect(url_for('contact'))
+        except Exception as e:
+            db.session.rollback()
+            flash('Произошла ошибка при сохранении сообщения. Попробуйте еще раз.', 'danger')
+            app.logger.error(f'Error saving message: {str(e)}')
+    
+    return render_template('contact.html', form=form)
+
+@app.route('/api/docs')
+def api_docs():
+    """Документация API"""
+    return render_template('api_docs.html')
+
+@app.route('/api/playground')
+@login_required
+def api_playground():
+    """Песочница для тестирования API"""
+    return render_template('api_playground.html')
+
+# ============= MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ API =============
+
+@app.after_request
+def after_request(response):
+    """Логирование API запросов"""
+    if request.path.startswith('/api/'):
+        start_time = request.environ.get('start_time', datetime.utcnow())
+        response_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        user_id = None
+        if current_user.is_authenticated:
+            user_id = current_user.id
+        
+        log_api_request(
+            endpoint=request.path,
+            method=request.method,
+            user_id=user_id,
+            ip_address=request.remote_addr,
+            user_agent=request.user_agent.string,
+            status_code=response.status_code,
+            response_time=response_time
+        )
+    
+    return response
+
+@app.before_request
+def before_request():
+    """Устанавливаем время начала запроса для API"""
+    if request.path.startswith('/api/'):
+        request.environ['start_time'] = datetime.utcnow()
+
+# ============= КОМАНДЫ CLI =============
+
+@app.cli.command('init-db')
+def init_db_command():
+    """Инициализирует базу данных."""
+    db.create_all()
+    print('База данных инициализирована.')
+
+@app.cli.command('seed-db')
+def seed_db_command():
+    """Заполняет базу данных тестовыми данными."""
+    from datetime import datetime, timedelta
+    
+    # Тестовые пользователи
+    users = [
+        User(username='testuser', email='user@example.com', is_admin=False),
+        User(username='admin', email='admin@example.com', is_admin=True),
+        User(username='moderator', email='moderator@example.com', is_admin=False)
+    ]
+    
+    for user in users:
+        user.set_password('password123')
+        if not User.query.filter_by(email=user.email).first():
+            db.session.add(user)
+    
+    db.session.commit()
+    
+    # Тестовые сообщения
+    test_messages = [
+        ContactMessage(
+            name='Иван Иванов',
+            email='ivan@example.com',
+            message='Тестовое сообщение 1',
+            created_at=datetime.utcnow() - timedelta(days=3),
+            is_read=True
+        ),
+        ContactMessage(
+            name='Мария Петрова',
+            email='maria@example.com',
+            message='Тестовое сообщение 2',
+            created_at=datetime.utcnow() - timedelta(days=1),
+            is_read=False
+        ),
+    ]
+    
+    for msg in test_messages:
+        if not ContactMessage.query.filter_by(email=msg.email, created_at=msg.created_at).first():
+            db.session.add(msg)
+    
+    # Тестовые посты
+    users_db = User.query.all()
+    if users_db:
+        test_posts = [
+            Post(
+                user_id=users_db[0].id,
+                title='Первый пост',
+                content='Содержание первого поста',
+                tags='flask,api,rest',
+                is_published=True
+            ),
+            Post(
+                user_id=users_db[1].id,
+                title='Второй пост',
+                content='Содержание второго поста',
+                tags='python,web',
+                is_published=False
+            ),
+        ]
+        
+        for post in test_posts:
+            if not Post.query.filter_by(title=post.title).first():
+                db.session.add(post)
+    
+    db.session.commit()
+    print('Тестовые данные добавлены в базу данных.')
+
+@app.cli.command('create-admin')
+def create_admin():
+    """Создание администратора."""
+    from getpass import getpass
+    
+    username = input('Имя пользователя: ')
+    email = input('Email: ')
+    password = getpass('Пароль: ')
+    confirm_password = getpass('Подтвердите пароль: ')
+    
+    if password != confirm_password:
+        print('Пароли не совпадают!')
+        return
+    
+    if User.query.filter_by(email=email).first():
+        print('Пользователь с таким email уже существует!')
+        return
+    
+    if User.query.filter_by(username=username).first():
+        print('Пользователь с таким именем уже существует!')
+        return
+    
+    admin = User(
+        username=username,
+        email=email,
+        is_admin=True
+    )
+    admin.set_password(password)
+    
+    db.session.add(admin)
+    db.session.commit()
+    print(f'Администратор {username} успешно создан!')
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
+
+{% extends "base.html" %}
+
+{% block title %}Документация API{% endblock %}
+
+{% block content %}
+<div class="api-docs-container">
+    <h1>Документация REST API</h1>
+    
+    <div class="api-info">
+        <div class="api-version">
+            <span class="badge badge-primary">v1.0</span>
+            <span>Base URL: <code>/api/v1</code></span>
+        </div>
+        
+        <div class="auth-info">
+            <h3>Аутентификация</h3>
+            <p>Для доступа к защищенным эндпоинтам используйте JWT токен:</p>
+            <ul>
+                <li>Получите токен через <code>POST /api/v1/login</code></li>
+                <li>Добавьте в заголовки: <code>Authorization: Bearer YOUR_TOKEN</code></li>
+                <li>Токен действителен 1 час, обновите через <code>POST /api/v1/refresh</code></li>
+            </ul>
+        </div>
+    </div>
+    
+    <div class="api-endpoints">
+        <h2>Эндпоинты API</h2>
+        
+        <div class="endpoint-category">
+            <h3>Аутентификация</h3>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <code>/api/v1/login</code>
+                    <span class="public">Публичный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Вход в систему и получение JWT токена</p>
+                    <pre><code>{
+  "email": "user@example.com",
+  "password": "password123"
+}</code></pre>
+                </div>
+            </div>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <code>/api/v1/refresh</code>
+                    <span class="protected">Защищенный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Обновление access токена с помощью refresh токена</p>
+                    <p>Заголовок: <code>Authorization: Bearer REFRESH_TOKEN</code></p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="endpoint-category">
+            <h3>Пользователи</h3>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <code>/api/v1/users</code>
+                    <span class="public">Публичный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Регистрация нового пользователя</p>
+                    <pre><code>{
+  "username": "newuser",
+  "email": "new@example.com",
+  "password": "password123"
+}</code></pre>
+                </div>
+            </div>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <code>/api/v1/users</code>
+                    <span class="admin">Только админ</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Получение списка всех пользователей</p>
+                </div>
+            </div>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <code>/api/v1/users/{user_id}</code>
+                    <span class="protected">Защищенный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Получение информации о пользователе</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="endpoint-category">
+            <h3>Сообщения</h3>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <code>/api/v1/messages</code>
+                    <span class="public">Публичный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Получение списка сообщений с пагинацией</p>
+                    <p>Параметры: <code>page</code>, <code>per_page</code>, <code>is_read</code>, <code>sort_by</code></p>
+                </div>
+            </div>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <code>/api/v1/messages</code>
+                    <span class="public">Публичный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Создание нового сообщения</p>
+                    <pre><code>{
+  "name": "Иван Иванов",
+  "email": "ivan@example.com",
+  "message": "Текст сообщения"
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="endpoint-category">
+            <h3>Посты</h3>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <code>/api/v1/posts</code>
+                    <span class="public">Публичный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Получение списка постов</p>
+                    <p>Параметры: <code>page</code>, <code>per_page</code>, <code>tag</code>, <code>search</code>, <code>published_only</code></p>
+                </div>
+            </div>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method post">POST</span>
+                    <code>/api/v1/posts</code>
+                    <span class="protected">Защищенный</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Создание нового поста</p>
+                    <pre><code>{
+  "title": "Заголовок поста",
+  "content": "Содержание поста",
+  "is_published": true,
+  "tags": "flask,api,rest"
+}</code></pre>
+                </div>
+            </div>
+        </div>
+        
+        <div class="endpoint-category">
+            <h3>Статистика</h3>
+            
+            <div class="endpoint">
+                <div class="endpoint-header">
+                    <span class="method get">GET</span>
+                    <code>/api/v1/stats</code>
+                    <span class="admin">Только админ</span>
+                </div>
+                <div class="endpoint-description">
+                    <p>Получение статистики приложения</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="api-examples">
+        <h3>Примеры запросов</h3>
+        
+        <div class="example">
+            <h4>Получение токена (cURL)</h4>
+            <pre><code>curl -X POST http://localhost:5000/api/v1/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"password123"}'</code></pre>
+        </div>
+        
+        <div class="example">
+            <h4>Создание сообщения (cURL)</h4>
+            <pre><code>curl -X POST http://localhost:5000/api/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Иван","email":"ivan@example.com","message":"Привет!"}'</code></pre>
+        </div>
+        
+        <div class="example">
+            <h4>Получение постов (JavaScript)</h4>
+            <pre><code>fetch('/api/v1/posts?page=1&per_page=10')
+  .then(response => response.json())
+  .then(data => console.log(data));</code></pre>
+        </div>
+    </div>
+    
+    <div class="api-playground-link">
+        <a href="{{ url_for('api_playground') }}" class="btn btn-primary">
+            <i class="icon-play"></i> Тестировать API
+        </a>
+    </div>
+</div>
+{% endblock %}
+
+Flask>=2.3.0
+Flask-WTF>=1.1.0
+Flask-SQLAlchemy>=3.0.0
+Flask-Login>=0.6.0
+Flask-RESTful>=0.3.10
+Flask-JWT-Extended>=4.5.0
+Flask-CORS>=4.0.0
+WTForms>=3.0.0
+python-dotenv>=1.0.0
+Werkzeug>=2.3.0
+
+SECRET_KEY=your-super-secret-key-change-in-production
+JWT_SECRET_KEY=jwt-super-secret-key-change-in-production
+FLASK_APP=app.py
+FLASK_ENV=development
+DATABASE_URL=sqlite:///app.db
+
+Документация API эндпоинтов
+
+Основные эндпоинты:
+
+Аутентификация:
+
+· POST /api/v1/login - Вход и получение JWT токена
+· POST /api/v1/refresh - Обновление access токена
+
+Пользователи:
+
+· GET /api/v1/users - Список пользователей (admin)
+· POST /api/v1/users - Регистрация
+· GET /api/v1/users/{id} - Информация о пользователе
+· PUT /api/v1/users/{id} - Обновление пользователя
+· DELETE /api/v1/users/{id} - Удаление пользователя (admin)
+
+Сообщения:
+
+· GET /api/v1/messages - Список сообщений с пагинацией
+· POST /api/v1/messages - Создание сообщения
+· GET /api/v1/messages/{id} - Получение сообщения
+· PUT /api/v1/messages/{id} - Обновление сообщения
+· DELETE /api/v1/messages/{id} - Удаление сообщения
+
+Посты:
+
+· GET /api/v1/posts - Список постов
+· POST /api/v1/posts - Создание поста
+· GET /api/v1/posts/{id} - Получение поста
+· PUT /api/v1/posts/{id} - Обновление поста
+· DELETE /api/v1/posts/{id} - Удаление поста
+
+Статистика:
+
+· GET /api/v1/stats - Статистика приложения (admin)
+
+Примеры использования API
+
+Получение токена:
+
+```bash
+curl -X POST http://localhost:5000/api/v1/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"password123"}'
+```
+
+Создание поста:
+
+```bash
+curl -X POST http://localhost:5000/api/v1/posts \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -d '{"title":"Мой пост","content":"Содержание","tags":"flask,api"}'
+```
+
+Получение списка постов:
+
+```bash
+curl -X GET "http://localhost:5000/api/v1/posts?page=1&per_page=10&tag=flask" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+7. Команды для запуска
+
+```bash
+# Установка зависимостей
+pip install -r requirements.txt
+
+# Инициализация базы данных
+flask init-db
+
+# Создание тестовых данных
+flask seed-db
+
+# Создание администратора
+flask create-admin
+
+# Запуск приложения
+flask run
+```
+
+Основные возможности REST API:
+
+1. Полноценное REST API с CRUD операциями
+2. JWT аутентификация с access и refresh токенами
+3. Пагинация и фильтрация для всех списков
+4. Логирование API запросов в базу данных
+5. CORS поддержка для фронтенд-приложений
+6. Валидация запросов через Flask-RESTful
+7. Документация API и интерактивная песочница
+8. Статистика использования API
+9. API ключи пользователей
+10. Поиск и сортировка по различным полям
+
+Приложение теперь предоставляет как веб-интерфейс, так и полноценное REST API для интеграции с другими приложениями и мобильными клиентами.
